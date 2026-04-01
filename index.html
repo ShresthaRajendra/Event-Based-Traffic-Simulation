@@ -1,0 +1,323 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Event Traffic Digital Twin</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <style>
+        body { margin:0; }
+        #map { height:100vh; }
+
+        #panel {
+            position:absolute;
+            top:10px;
+            left:10px;
+            background:white;
+            padding:15px;
+            z-index:1000;
+            width:300px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div id="panel">
+    <h3>Traffic Digital Twin</h3>
+
+    <button onclick="resetPoints()">Reset Points</button>
+
+    <select id="event">
+        <option value="none">None</option>
+        <option value="concert">Concert</option>
+        <option value="football">Football</option>
+    </select>
+
+    <button onclick="getRoute()">Show Route</button>
+
+    <div id="info"></div>
+</div>
+
+<div id="map"></div>
+
+<script>
+
+// ================= VARIABLES =================
+let startPoint = null;
+let endPoint = null;
+let startMarker, endMarker;
+
+let vehicles = [];
+let vehicleMarkers = [];
+let activeRoute = [];
+let routeLayers = [];
+let allRoutes = [];   // store multiple routes
+const carIcon = L.icon({
+    iconUrl: 'car.png',   // path to your car image
+    iconSize: [32, 32],   // size of icon
+    iconAnchor: [16, 16], // center of icon
+});
+const routeColors = ["blue", "green", "purple"];
+
+// ================= MAP =================
+const map = L.map('map').setView([28.5383, -81.3792], 12);
+
+// Base map
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+// ================= TOMTOM TRAFFIC =================
+const tomtomKey = "e0GCpBun6qwRTDLFMmmpt2rnY5CG5apt";
+
+L.tileLayer(`https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?key=${tomtomKey}`, {
+    opacity: 0.7
+}).addTo(map);
+
+L.tileLayer(`https://api.tomtom.com/traffic/map/4/tile/incidents/{z}/{x}/{y}.png?key=${tomtomKey}`, {
+    opacity: 0.8
+}).addTo(map);
+
+// ================= STADIUM =================
+const stadium = [28.5392, -81.4028];
+
+L.circle(stadium, {
+    radius: 1200,
+    color: "red",
+    fillOpacity: 0.2
+}).addTo(map);
+
+// ================= MAP CLICK =================
+map.on('click', function(e){
+
+    if(!startPoint){
+        startPoint = e.latlng;
+
+        startMarker = L.marker(startPoint)
+            .addTo(map)
+            .bindPopup("Start")
+            .openPopup();
+
+    } else if(!endPoint){
+        endPoint = e.latlng;
+
+        endMarker = L.marker(endPoint)
+            .addTo(map)
+            .bindPopup("Destination")
+            .openPopup();
+
+    } else {
+        alert("Click Reset Points first");
+    }
+});
+
+// ================= RESET =================
+function resetPoints(){
+
+    if(startMarker) map.removeLayer(startMarker);
+    if(endMarker) map.removeLayer(endMarker);
+
+    startPoint = null;
+    endPoint = null;
+
+    clearRoutes();
+
+    vehicleMarkers.forEach(m => map.removeLayer(m));
+    vehicleMarkers = [];
+
+    activeRoute = [];
+
+    document.getElementById("info").innerHTML = "";
+}
+
+// ================= HELPERS =================
+function clearRoutes(){
+    routeLayers.forEach(l => map.removeLayer(l));
+    routeLayers = [];
+}
+
+function isNearStadium(lat, lon){
+    const dx = lat - stadium[0];
+    const dy = lon - stadium[1];
+    return Math.sqrt(dx*dx + dy*dy) < 0.01;
+}
+
+function getDensity(lat, lon){
+    let count = 0;
+
+    vehicles.forEach(v => {
+
+        if(!activeRoute.length) return;
+
+        const p1 = activeRoute[v.index];
+        const p2 = activeRoute[v.index + 1];
+
+        // interpolate vehicle position
+        const vlat = p1[0] + (p2[0] - p1[0]) * v.t;
+        const vlon = p1[1] + (p2[1] - p1[1]) * v.t;
+
+        const d = Math.sqrt((vlat - lat)**2 + (vlon - lon)**2);
+
+        if(d < 0.005) count++;
+    });
+
+    return count;
+}
+// ================= VEHICLE SIM =================
+function generateVehicles(routeCoords, event){
+
+    vehicles = [];
+
+    const base = 30;
+    const extra = (event==="football") ? 60 : (event==="concert") ? 40 : 0;
+
+    for(let i=0;i<base+extra;i++){
+        const idx = Math.floor(Math.random() * (routeCoords.length - 2));
+
+        vehicles.push({
+            index: idx,   // current segment on route
+            t: Math.random(), // start at random position along segment
+            speed: (event==="football") ? 0.004 :
+                   (event==="concert") ? 0.006 : 0.008
+        });
+    }
+}
+
+function drawVehicles(routeCoords) {
+
+    // remove old markers
+    vehicleMarkers.forEach(m => map.removeLayer(m));
+    vehicleMarkers = [];
+
+    vehicles.forEach(v => {
+
+        const p1 = routeCoords[v.index];
+        const p2 = routeCoords[v.index + 1];
+
+        // interpolate position
+        const lat = p1[0] + (p2[0] - p1[0]) * v.t;
+        const lon = p1[1] + (p2[1] - p1[1]) * v.t;
+
+        // compute rotation angle
+        const angle = getAngle(p1, p2);
+
+        const marker = L.marker([lat, lon], {
+            icon: carIcon,
+            rotationAngle: angle,
+            rotationOrigin: 'center center'
+        }).addTo(map);
+
+        vehicleMarkers.push(marker);
+    });
+}
+
+function getAngle(p1, p2) {
+    const dx = p2[1] - p1[1];
+    const dy = p2[0] - p1[0];
+    return Math.atan2(dy, dx) * 180 / Math.PI;
+}
+
+function moveVehicles(routeCoords, event) {
+
+    vehicles.forEach(v => {
+
+        let slowdown = 1;
+        const lat = routeCoords[v.index][0];
+        const lon = routeCoords[v.index][1];
+
+        if(event !== "none" && isNearStadium(lat, lon)){
+            slowdown = 0.4; // congestion
+        }
+
+        v.t += v.speed * slowdown;
+
+        // move to next segment
+        if(v.t >= 1){
+            v.t = 0;
+            v.index++;
+            if(v.index >= routeCoords.length - 1){
+                v.index = 0; // loop
+            }
+        }
+    });
+
+    drawVehicles(routeCoords);
+}
+
+// ================= ROUTE =================
+function getRoute(){
+
+    clearRoutes();
+    document.getElementById("info").innerHTML = "";
+
+    if(!startPoint || !endPoint){
+        alert("Select start and destination");
+        return;
+    }
+
+    const event = document.getElementById("event").value;
+
+    const url = `http://127.0.0.1:5000/api/traffic_route?start_lat=${startPoint.lat}&start_lon=${startPoint.lng}&end_lat=${endPoint.lat}&end_lon=${endPoint.lng}`;
+
+    fetch(url)
+    .then(res => res.json())
+    .then(data => {
+
+        allRoutes = data.routes;   // store all routes
+
+        let infoHTML = "";
+
+        allRoutes.forEach((route, i)=>{
+
+            const coords = route.coords;
+
+            // 🎨 DRAW EACH ROUTE
+            for(let j=0;j<coords.length-1;j++){
+
+                const seg = L.polyline([coords[j], coords[j+1]], {
+                    color: routeColors[i % routeColors.length],
+                    weight: (i === 0) ? 6 : 4   // highlight best route
+                }).addTo(map);
+
+                routeLayers.push(seg);
+            }
+
+            // ⏱️ TIME CALCULATION
+            let baseTime = route.duration / 60;
+
+            let factor = 1;
+            if(event === "concert") factor = 1.2;
+            if(event === "football") factor = 1.5;
+
+            let finalTime = baseTime * factor;
+
+            infoHTML += `<b>Route ${i+1}</b>: ${finalTime.toFixed(1)} min<br>`;
+        });
+
+        document.getElementById("info").innerHTML = infoHTML;
+
+        // 🚗 ONLY animate BEST route (index 0)
+        activeRoute = allRoutes[0].coords;
+
+        generateVehicles(activeRoute, event);
+        drawVehicles(activeRoute);
+
+    })
+    .catch(err => {
+        console.error("Route error:", err);
+    });
+}
+
+// ================= ANIMATION =================
+setInterval(() => {
+    if(activeRoute.length > 0){
+        const event = document.getElementById("event").value;
+        moveVehicles(activeRoute, event);
+    }
+}, 100);  // updates every 200ms
+
+</script>
+
+</body>
+</html>
